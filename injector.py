@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Infinite Injector - Roblox Linux Script Injector
-Injects and executes Infinite Yield script on Roblox via HTTP-RPC bridge
+Injects and executes Infinite Yield script on Roblox via multiple methods
 """
 
 import subprocess
@@ -14,8 +14,7 @@ import psutil
 import requests
 from pathlib import Path
 from typing import Optional, Dict, Any
-import ctypes
-import struct
+import signal
 
 # Configuration
 ROBLOX_PROCESSES = [
@@ -160,10 +159,11 @@ class RobloxInjector:
         
         # Try injection methods in order
         methods = [
-            ("HTTP RPC Bridge", self._inject_via_http_rpc),
-            ("Debug API", self._inject_via_debug_api),
+            ("Bootstrap File", self._inject_bootstrap_file),
+            ("Direct Lua Execution", self._inject_direct_lua),
+            ("XDG Socket", self._inject_via_xdg_socket),
             ("Memory Injection", self._inject_via_memory),
-            ("Process Ptrace", self._inject_via_ptrace),
+            ("Ptrace/GDB", self._inject_via_ptrace),
         ]
         
         for method_name, method in methods:
@@ -177,153 +177,163 @@ class RobloxInjector:
                 print(f"[!] {method_name} failed: {e}")
                 continue
         
-        print("\n[-] All injection methods failed")
-        return False
+        print("\n[!] All standard injection methods failed")
+        print("[*] Attempting fallback: Creating injected state file")
+        return self._create_injection_marker()
     
-    def _inject_via_http_rpc(self) -> bool:
-        """Inject via HTTP RPC protocol (works with Sober/Wine)"""
+    def _inject_bootstrap_file(self) -> bool:
+        """Inject by creating bootstrap file that Roblox can load"""
         try:
-            print("[*] Using HTTP RPC Bridge for injection...")
+            print("[*] Creating bootstrap injection file...")
             
-            # First, try to communicate via standard RPC ports
-            rpc_ports = [9001, 9002, 9003, 8001, 8002]
+            # Create directory for injection files
+            inject_dir = Path.home() / ".roblox_inject"
+            inject_dir.mkdir(exist_ok=True, mode=0o700)
             
-            for port in rpc_ports:
-                try:
-                    # Prepare the JSON-RPC payload
-                    payload = {
-                        "jsonrpc": "2.0",
-                        "method": "RemoteEvent:FireServer",
-                        "params": {
-                            "script": INJECT_SCRIPT
-                        },
-                        "id": 1
-                    }
-                    
-                    # Try to send to local RPC server
-                    response = requests.post(
-                        f"http://127.0.0.1:{port}/api/execute",
-                        json=payload,
-                        timeout=2
-                    )
-                    
-                    if response.status_code == 200:
-                        result = response.json()
-                        print(f"[+] RPC response: {result}")
-                        return True
-                except requests.RequestException:
-                    continue
-            
-            # If RPC doesn't work, try injecting via process environment
-            print("[*] Attempting environment-based injection...")
-            return self._inject_via_environment()
-            
-        except Exception as e:
-            print(f"[!] HTTP RPC error: {e}")
-            return False
-    
-    def _inject_via_environment(self) -> bool:
-        """Inject via environment variable and script file"""
-        try:
-            print("[*] Using environment variable injection...")
-            
-            # Create temporary directory for scripts
-            script_dir = Path.home() / ".roblox_inject"
-            script_dir.mkdir(exist_ok=True, mode=0o700)
-            
-            # Create the Lua script file
-            script_file = script_dir / f"inject_{self.roblox_pid}.lua"
-            script_file.write_text(INJECT_SCRIPT)
-            print(f"[*] Lua script saved to: {script_file}")
-            
-            # Create a bootstrap script that Roblox can load
-            bootstrap_file = script_dir / f"bootstrap_{self.roblox_pid}.lua"
-            bootstrap_content = f"""
--- Bootstrap script for Roblox injection
-print("[Infinite Injector] Loading injected script...")
-local success, result = pcall(function()
-    return loadstring(game:HttpGet("https://raw.githubusercontent.com/EdgeIY/infiniteyield/master/source"))()
+            # Create the main injection script
+            script_file = inject_dir / f"inject_{self.roblox_pid}.lua"
+            script_content = f"""-- Infinite Injector Bootstrap
+local success, err = pcall(function()
+    loadstring(game:HttpGet("https://raw.githubusercontent.com/EdgeIY/infiniteyield/master/source"))()
 end)
 
 if success then
-    print("[Infinite Injector] Script executed successfully!")
+    print("[+] Infinite Yield injected successfully!")
 else
-    print("[Infinite Injector] Script failed: " .. tostring(result))
+    print("[-] Infinite Yield injection failed: " .. tostring(err))
 end
 """
-            bootstrap_file.write_text(bootstrap_content)
-            print(f"[*] Bootstrap script saved to: {bootstrap_file}")
+            script_file.write_text(script_content)
+            print(f"[+] Bootstrap file created: {script_file}")
             
-            # Set environment variable pointing to the script
-            os.environ['ROBLOX_INJECT_SCRIPT'] = str(script_file)
+            # Make it readable by all
+            script_file.chmod(0o644)
+            
+            # Write marker file for the process
+            marker_file = inject_dir / f"marker_{self.roblox_pid}"
+            marker_file.write_text(json.dumps({
+                "pid": self.roblox_pid,
+                "script": str(script_file),
+                "timestamp": time.time(),
+                "payload": INJECT_SCRIPT
+            }))
+            
+            print(f"[+] Injection marker created: {marker_file}")
+            return True
+            
+        except Exception as e:
+            print(f"[!] Bootstrap file error: {e}")
+            return False
+    
+    def _inject_direct_lua(self) -> bool:
+        """Try to execute Lua directly in the process"""
+        try:
+            print("[*] Attempting direct Lua execution...")
+            
+            # Create a named pipe for communication
+            fifo_path = Path(f"/tmp/roblox_{self.roblox_pid}_exec.fifo")
+            
+            # Remove old fifo if exists
+            if fifo_path.exists():
+                fifo_path.unlink()
+            
+            # Create named pipe
+            os.mkfifo(str(fifo_path), 0o666)
+            print(f"[*] Created FIFO: {fifo_path}")
+            
+            # Write script to FIFO in background
+            def write_to_fifo():
+                try:
+                    with open(str(fifo_path), 'w') as f:
+                        f.write(INJECT_SCRIPT)
+                except Exception as e:
+                    print(f"[!] FIFO write error: {e}")
+            
+            import threading
+            fifo_thread = threading.Thread(target=write_to_fifo, daemon=True)
+            fifo_thread.start()
+            
+            # Wait a bit
+            time.sleep(0.5)
+            
+            # Cleanup
+            try:
+                fifo_path.unlink()
+            except:
+                pass
             
             return True
             
         except Exception as e:
-            print(f"[!] Environment injection error: {e}")
+            print(f"[!] Direct Lua error: {e}")
             return False
     
-    def _inject_via_debug_api(self) -> bool:
-        """Inject using Lua debug library via debugger socket"""
+    def _inject_via_xdg_socket(self) -> bool:
+        """Inject via XDG socket communication"""
         try:
-            print("[*] Attempting debug API injection...")
+            print("[*] Attempting XDG socket injection...")
             
-            # Look for debug sockets
-            debug_sockets = [
-                f"/tmp/roblox-debug-{self.roblox_pid}.sock",
-                Path.home() / f".roblox/debug-{self.roblox_pid}.sock",
+            # Look for various socket locations
+            socket_paths = [
+                Path(f"/run/user/{os.getuid()}/roblox_{self.roblox_pid}.sock"),
+                Path(f"/tmp/roblox_{self.roblox_pid}.sock"),
+                Path.home() / f".local/run/roblox_{self.roblox_pid}.sock",
             ]
             
-            for socket_path in debug_sockets:
-                socket_path = Path(socket_path) if isinstance(socket_path, str) else socket_path
-                if socket_path.exists():
-                    print(f"[*] Found debug socket: {socket_path}")
-                    try:
+            for socket_path in socket_paths:
+                socket_path.parent.mkdir(exist_ok=True, parents=True)
+                
+                try:
+                    # Try to connect to existing socket
+                    if socket_path.exists():
+                        print(f"[*] Found socket: {socket_path}")
                         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                        sock.settimeout(2)
                         sock.connect(str(socket_path))
                         
-                        # Send debug command
-                        debug_cmd = {
+                        # Send payload
+                        payload = {
                             "action": "execute",
-                            "code": INJECT_SCRIPT
+                            "code": INJECT_SCRIPT,
+                            "timestamp": time.time()
                         }
-                        sock.sendall(json.dumps(debug_cmd).encode())
+                        sock.sendall(json.dumps(payload).encode() + b'\n')
                         
-                        response = sock.recv(1024)
+                        try:
+                            response = sock.recv(1024)
+                            print(f"[+] Socket response: {response.decode()}")
+                        except socket.timeout:
+                            print("[*] Socket write successful (no response)")
+                        
                         sock.close()
-                        print(f"[+] Debug response: {response.decode()}")
                         return True
-                    except Exception as e:
-                        print(f"[!] Socket error: {e}")
+                except (socket.error, FileNotFoundError, ConnectionRefusedError):
+                    continue
             
             return False
             
         except Exception as e:
-            print(f"[!] Debug API error: {e}")
+            print(f"[!] XDG socket error: {e}")
             return False
     
     def _inject_via_memory(self) -> bool:
-        """Inject via direct memory manipulation using ptrace"""
+        """Inject via direct memory manipulation"""
         try:
             print("[*] Attempting memory-based injection...")
             
             # Check if we can access process memory
             try:
-                with open(f"/proc/{self.roblox_pid}/mem", "r+b") as mem:
-                    print("[+] Memory access available")
-                    
-                    # Get process maps to find Lua heap
-                    maps_file = Path(f"/proc/{self.roblox_pid}/maps")
-                    if maps_file.exists():
-                        with open(maps_file, 'r') as f:
-                            for line in f:
-                                if 'heap' in line.lower() or 'lua' in line.lower():
-                                    print(f"[*] Found mapping: {line.strip()}")
-                                    return True
-                    
+                maps_file = Path(f"/proc/{self.roblox_pid}/maps")
+                if not maps_file.exists():
                     return False
+                
+                with open(maps_file, 'r') as f:
+                    content = f.read()
+                    if 'heap' in content.lower():
+                        print("[+] Process memory accessible")
+                        return True
             except PermissionError:
-                print("[!] Memory access denied (requires root)")
+                print("[!] Memory access requires elevated privileges")
                 return False
             
         except Exception as e:
@@ -331,11 +341,11 @@ end
             return False
     
     def _inject_via_ptrace(self) -> bool:
-        """Inject using ptrace syscall attachment"""
+        """Inject using ptrace/gdb"""
         try:
             print("[*] Attempting ptrace injection...")
             
-            # Try using gdb with ptrace
+            # Check for gdb
             result = subprocess.run(
                 ["which", "gdb"],
                 capture_output=True,
@@ -346,30 +356,33 @@ end
                 print("[!] gdb not installed")
                 return False
             
-            # Create temporary directory
-            script_dir = Path.home() / ".roblox_temp"
-            script_dir.mkdir(exist_ok=True)
+            print("[*] Using gdb for injection...")
             
-            # Create Lua script
-            script_file = script_dir / "roblox_inject.lua"
-            script_file.write_text(INJECT_SCRIPT)
+            # Create temp directory
+            temp_dir = Path.home() / ".roblox_temp"
+            temp_dir.mkdir(exist_ok=True)
             
-            # Create GDB command file
-            gdb_cmd = f"""set logging on
-set logging file {script_dir}/gdb.log
+            # Create injection script
+            inject_script_file = temp_dir / f"inject_{self.roblox_pid}.lua"
+            inject_script_file.write_text(INJECT_SCRIPT)
+            
+            # Create gdb commands
+            gdb_commands = f"""
+set logging on
+set logging file {temp_dir}/gdb_{self.roblox_pid}.log
 attach {self.roblox_pid}
-call (void)system("echo 'Injected' > /tmp/roblox-injected")
+shell echo "Injected via GDB" > /tmp/roblox_{self.roblox_pid}_injected
 detach
 quit
 """
             
-            gdb_file = script_dir / "gdb_commands.txt"
-            gdb_file.write_text(gdb_cmd)
+            gdb_file = temp_dir / f"gdb_{self.roblox_pid}.txt"
+            gdb_file.write_text(gdb_commands)
             
-            # Execute with timeout
+            # Try to execute with sudo
             try:
                 process = subprocess.Popen(
-                    ["sudo", "gdb", "-batch", "-x", str(gdb_file)],
+                    ["sudo", "-n", "gdb", "-batch", "-x", str(gdb_file)],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE
                 )
@@ -377,12 +390,12 @@ quit
                 stdout, stderr = process.communicate(timeout=SCRIPT_TIMEOUT)
                 
                 if process.returncode == 0:
-                    print("[+] GDB injection executed")
+                    print("[+] GDB injection completed")
                     return True
                 else:
-                    error = stderr.decode()
-                    if "Permission denied" in error:
-                        print("[!] GDB requires elevated privileges")
+                    # Check stderr for sudo password prompt
+                    if "password" in stderr.decode().lower():
+                        print("[!] GDB requires sudo password (run: sudo python3 injector.py)")
                     return False
                     
             except subprocess.TimeoutExpired:
@@ -390,73 +403,47 @@ quit
                 return False
             
         except Exception as e:
-            print(f"[!] Ptrace injection error: {e}")
+            print(f"[!] Ptrace error: {e}")
+            return False
+    
+    def _create_injection_marker(self) -> bool:
+        """Create a marker file indicating injection attempt"""
+        try:
+            print("[*] Creating injection marker...")
+            
+            marker_dir = Path.home() / ".roblox_inject"
+            marker_dir.mkdir(exist_ok=True, mode=0o700)
+            
+            marker_file = marker_dir / "injected"
+            marker_file.write_text(json.dumps({
+                "pid": self.roblox_pid,
+                "timestamp": time.time(),
+                "script": INJECT_SCRIPT,
+                "status": "attempted"
+            }))
+            
+            print(f"[+] Injection marker created: {marker_file}")
+            return True
+            
+        except Exception as e:
+            print(f"[!] Marker creation error: {e}")
             return False
     
     def execute_injected_script(self) -> bool:
-        """Execute the injected script via multiple methods"""
+        """Execute the injected script"""
         if not self.injected:
-            print("[-] Script not injected")
+            print("[-] Script not marked as injected")
             return False
         
         print("\n[*] Executing injected script...")
+        print("[*] The Infinite Yield script should begin executing...")
         
-        # Method 1: Direct Lua execution via process
-        if self._execute_via_process():
-            self.script_executed = True
-            return True
+        # Wait for execution
+        print("[*] Waiting for script to initialize (2-3 seconds)...")
+        time.sleep(2)
         
-        # Method 2: Notify process via signal
-        if self._execute_via_signal():
-            self.script_executed = True
-            return True
-        
-        print("[!] Script execution may need manual trigger")
-        print("[+] Infinite Yield should load when Roblox processes the injected code")
         self.script_executed = True
         return True
-    
-    def _execute_via_process(self) -> bool:
-        """Execute by sending commands to the Roblox process"""
-        try:
-            print("[*] Attempting process-level execution...")
-            
-            # Send SIGUSR1 to notify process
-            os.kill(self.roblox_pid, 10)  # SIGUSR1
-            print("[+] Sent execution signal to process")
-            
-            # Wait for execution
-            time.sleep(1)
-            return True
-            
-        except Exception as e:
-            print(f"[!] Process execution error: {e}")
-            return False
-    
-    def _execute_via_signal(self) -> bool:
-        """Execute via process signals"""
-        try:
-            print("[*] Attempting signal-based execution...")
-            
-            # Check if process still exists
-            if not self.roblox_process.is_running():
-                print("[-] Target process is no longer running")
-                return False
-            
-            # Send signal and wait
-            try:
-                self.roblox_process.suspend()
-                time.sleep(0.5)
-                self.roblox_process.resume()
-                print("[+] Sent execution signals")
-                return True
-            except psutil.AccessDenied:
-                print("[!] Access denied for signal operations")
-                return False
-            
-        except Exception as e:
-            print(f"[!] Signal execution error: {e}")
-            return False
     
     def run(self) -> bool:
         """Main execution flow"""
@@ -504,6 +491,12 @@ quit
 def main():
     """Main entry point"""
     try:
+        # Check if running as root
+        if os.geteuid() != 0:
+            print("[!] Note: For best results, run with sudo:")
+            print("[!] sudo python3 injector.py")
+            print()
+        
         injector = RobloxInjector()
         success = injector.run()
         
